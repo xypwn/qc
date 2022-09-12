@@ -35,14 +35,15 @@ typedef struct {
 	};
 } Tok;
 
-typedef struct Var {
+typedef struct {
 	char *name;
 	double val;
 } Var;
 
-typedef struct Func {
+typedef struct {
 	char *name;
-	double (*func)(double *args);
+	double (*func)(Expr *e, ExprArg *args);
+	ExprArgType *arg_types;
 	size_t n_args;
 } Func;
 
@@ -60,6 +61,8 @@ struct _Expr {
 	Func *funcs;
 	size_t funcs_len;
 	size_t funcs_cap;
+
+	void *userdata;
 };
 
 static size_t smap_get_idx(void *smap, const char *key, size_t type_size, size_t cap);
@@ -106,7 +109,7 @@ Expr *expr_new() {
 	Expr *res = malloc(sizeof(Expr));
 	*res = (Expr){0};
 	for (size_t i = 0; i < expr_n_builtin_funcs; i++) {
-		expr_set_func(res, expr_builtin_funcs[i].name, expr_builtin_funcs[i].func, expr_builtin_funcs[i].n_args);
+		expr_set_func(res, expr_builtin_funcs[i].name, expr_builtin_funcs[i].func, expr_builtin_funcs[i].arg_types, expr_builtin_funcs[i].n_args);
 	}
 	for (size_t i = 0; i < expr_n_builtin_vars; i++) {
 		expr_set_var(res, expr_builtin_vars[i].name, expr_builtin_vars[i].val);
@@ -206,10 +209,19 @@ bool expr_get_var(Expr *e, const char *name, double *out) {
 	return v.name != NULL;
 }
 
-void expr_set_func(Expr *e, const char *name, double (*func)(double *args), size_t n_args) {
+void expr_set_func(Expr *e, const char *name, double (*func)(Expr *e, ExprArg *args), ExprArgType *arg_types, size_t n_args) {
 	Func *v = smap_get_for_setting((void**)&e->funcs, name, sizeof(Func), &e->funcs_len, &e->funcs_cap);
 	v->func = func;
+	v->arg_types = arg_types;
 	v->n_args = n_args;
+}
+
+void expr_set_userdata(Expr *e, void *userdata) {
+	e->userdata = userdata;
+}
+
+void *expr_get_userdata(Expr *e) {
+	return e->userdata;
 }
 
 static void del_toks(Expr *e, Tok *start, Tok *end) {
@@ -244,15 +256,26 @@ static ExprError collapse(Expr *e, Tok *t) {
 	if (t[1].kind == TokIdent) {
 		if (t + 2 < e->toks_working + e->toks_working_len && (t[2].kind == TokOp && t[2].Char == '(')) {
 			/* Collapse function. */
-			double arg_results[16];
+			ExprArg arg_results[16];
 			size_t arg_results_size = 0;
+
+			Func func = get_func(e, t[1].Str);
+			if (func.name == NULL)
+				return (ExprError){.start = t[1].start, .end = t[1].end, .err = "unknown function"};
 
 			t += 2;
 			while (1) {
 				if (arg_results_size < 16) {
-					double res;
-					TRY(eval(e, t, &res));
-					arg_results[arg_results_size++] = res;
+					if (func.arg_types[arg_results_size] == ExprArgTypeNum) {
+						double res;
+						TRY(eval(e, t, &res));
+						arg_results[arg_results_size++].Num = res;
+					} else if (func.arg_types[arg_results_size] == ExprArgTypeStr) {
+						if (t[1].kind != TokIdent)
+							return (ExprError){.start = t[1].start, .end = t[1].end, .err = "expected string argument"};
+
+						arg_results[arg_results_size++].Str = t[1].Str;
+					}
 				}
 				size_t i = 1;
 				for (; !(t[i].kind == TokOp && OP_PREC(t[i].Char) == 0); i++);
@@ -266,14 +289,11 @@ static ExprError collapse(Expr *e, Tok *t) {
 			}
 			t -= 2;
 
-			Func func = get_func(e, t[1].Str);
-			if (func.name == NULL)
-				return (ExprError){.start = t[1].start, .end = t[1].end, .err = "unknown function"};
 			if (arg_results_size != func.n_args)
 				return (ExprError){.start = t[1].start, .end = t[1].end, .err = "invalid number of arguments to function"};
 
 			t[1].kind = TokNum;
-			t[1].Num = func.func(arg_results);
+			t[1].Num = func.func(e, arg_results);
 		} else {
 			/* Collapse variable. */
 			t[1].kind = TokNum;
@@ -293,7 +313,7 @@ static ExprError eval(Expr *e, Tok *t, double *out_res) {
 		TRY(collapse(e, t));
 
 		if (!(t[0].kind == TokOp && t[1].kind == TokNum && t[2].kind == TokOp)) {
-			return (ExprError){.start = t[0].start, .end = t[1].end, .err = "invalid token order"};
+			return (ExprError){.start = t[0].start, .end = t[1].end, .err = "unexpected token"};
 		}
 
 		const char curr_op = t[0].Char;
